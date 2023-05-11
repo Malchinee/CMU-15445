@@ -27,7 +27,7 @@ namespace bustub {
 template <typename K, typename V>
 ExtendibleHashTable<K, V>::ExtendibleHashTable(size_t bucket_size)
     : global_depth_(0), bucket_size_(bucket_size), num_buckets_(1) {
-  std::shared_ptr<Bucket> bucket(new Bucket(bucket_size, 0));
+  auto bucket = std::make_shared<Bucket>(bucket_size);
   dir_.emplace_back(bucket);
 }
 
@@ -87,56 +87,47 @@ auto ExtendibleHashTable<K, V>::Remove(const K &key) -> bool {
 template <typename K, typename V>
 void ExtendibleHashTable<K, V>::Insert(const K &key, const V &value) {
   std::scoped_lock<std::mutex> lock(latch_);
-  return InsertInternal(key, value);
-}
 
-template <typename K, typename V>
-void ExtendibleHashTable<K, V>::InsertInternal(const K &key, const V &value) {
-  size_t index = IndexOf(key);
-  std::shared_ptr<Bucket> bucket = dir_[index];
-  bool res = bucket->Insert(key, value);
-  if (res) {
-    return;
-  }
-  // 如果桶的depth等于global_depth_; directory翻倍
-  if (GetGlobalDepth() == bucket->GetDepth()) {
-    global_depth_++;
-    size_t capacity = dir_.size();
-    dir_.resize(capacity * 2);
-    for (size_t i = 0; i < capacity; i++) {
-      dir_[i + capacity] = dir_[i];
+  // 自旋锁进入死锁等待
+  while (true) {
+    size_t index = IndexOf(key);
+    if (dir_[index]->Insert(key, value)) {  // 如果该位置已经存在，直接返回
+      return;
     }
-  }
-  int new_depth = bucket->GetDepth() + 1;
-  // base_mask和split_mask用来确定查分的bucket的位置
-  size_t base_mask = (1 << bucket->GetDepth()) - 1;
-  size_t split_mask = (1 << new_depth) - 1;
-
-  // 两个需要查分的桶的指针
-  auto first_bucket = std::make_shared<Bucket>(bucket_size_, new_depth);
-  auto second_bucket = std::make_shared<Bucket>(bucket_size_, new_depth);
-
-  size_t low_index = index & base_mask;
-  for (const auto &ele : bucket->GetItems()) {
-    size_t split_index = IndexOf(ele.first);
-    if ((split_index & split_mask) == low_index) {
-      first_bucket->GetItems().emplace_back(ele);
-      continue;
-    }
-    second_bucket->GetItems().emplace_back(ele);
-  }
-  for (size_t i = 0; i < dir_.size(); i++) {
-    if ((i & base_mask) == low_index) {
-      if ((i & split_mask) == low_index) {
-        dir_[i] = first_bucket;
-        continue;
+    int local_depth = dir_[index]->GetDepth();
+    // 如果深度已经达到global_depth_，扩容哈希表
+    if (local_depth == global_depth_) {
+      global_depth_++;
+      dir_.resize(dir_.size() * 2);
+      for (size_t i = dir_.size() / 2; i < dir_.size(); i++) {
+        dir_[i] = dir_[i - dir_.size() / 2];
       }
-      dir_[i] = second_bucket;
+    }
+
+    dir_[index]->IncrementDepth();
+    // 创建新的bucket
+    std::shared_ptr<Bucket> bucket = std::make_shared<Bucket>(bucket_size_, dir_[index]->GetDepth());
+    num_buckets_++;
+
+    auto list = dir_[index]->GetItems();
+    dir_[index]->Clear();
+    size_t low = index & ((1 << local_depth) - 1);
+    for (size_t i = 0; i < dir_.size(); i++) {
+      // 如果哈希值和深度的二进制表示  异或 为 0
+      if ((low ^ (i & ((1 << local_depth) - 1))) == 0) {
+        // 如果该位置是偶数
+        if (((i >> local_depth) & 1) == 1) {
+          dir_[i] = bucket;
+        }
+      }
+    }
+    auto it = list.begin();
+    for (; it != list.end(); it++) {
+      dir_[IndexOf(it->first)]->Insert(it->first, it->second);
     }
   }
-  num_buckets_++;
-  return InsertInternal(key, value);
 }
+
 //===--------------------------------------------------------------------===//
 // Bucket
 //===--------------------------------------------------------------------===//
@@ -167,6 +158,7 @@ auto ExtendibleHashTable<K, V>::Bucket::Remove(const K &key) -> bool {
 
 template <typename K, typename V>
 auto ExtendibleHashTable<K, V>::Bucket::Insert(const K &key, const V &value) -> bool {
+  // 如果key-value已经存在，则覆盖value
   for (auto &[k, v] : list_) {
     if (k == key) {
       v = value;
